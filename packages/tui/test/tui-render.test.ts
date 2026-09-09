@@ -950,3 +950,144 @@ describe("TUI differential rendering", () => {
 		tui.stop();
 	});
 });
+
+// Regression coverage for the "terminal randomly scrolls to the top" family of reports
+// (e.g. changes above the pinned-to-bottom viewport used to unconditionally trigger a full
+// redraw, which clears scrollback via ESC[3J and replays the whole transcript).
+describe("TUI off-screen updates (no destructive full redraw)", () => {
+	it("tracks off-screen edits internally without painting or clearing scrollback", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = Array.from({ length: 12 }, (_, i) => `Line ${i}`);
+		tui.start();
+		await terminal.waitForRender();
+
+		const initialRedraws = tui.fullRedraws;
+		terminal.clearWrites();
+
+		// Line 2 is above the pinned-to-bottom viewport (rows 7-11 are visible in a 5-row
+		// terminal), so this edit isn't visible on screen.
+		component.lines[2] = "Line 2 UPDATED";
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.strictEqual(tui.fullRedraws, initialRedraws, "Off-screen change should not trigger a full redraw");
+		assert.ok(!terminal.getWrites().includes("\x1b[3J"), "Off-screen change should not clear scrollback");
+		assert.ok(!terminal.getWrites().includes("\x1b[2J"), "Off-screen change should not clear the screen");
+		assert.deepStrictEqual(terminal.getViewport(), ["Line 7", "Line 8", "Line 9", "Line 10", "Line 11"]);
+
+		// Drop the last line without touching line 2 again. If the skipped render above hadn't
+		// updated internal bookkeeping, this would spuriously re-diff line 2 too and fall back
+		// to a full redraw (off-screen change + shrink); with correct bookkeeping it's purely a
+		// trailing deletion, which stays off the full-redraw path.
+		component.lines = component.lines.slice(0, -1);
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.strictEqual(
+			tui.fullRedraws,
+			initialRedraws,
+			"Trailing deletion after an off-screen edit should stay differential",
+		);
+
+		tui.stop();
+	});
+
+	it("clamps to the visible range when a change spans on-screen and off-screen rows", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = Array.from({ length: 12 }, (_, i) => `Line ${i}`);
+		tui.start();
+		await terminal.waitForRender();
+
+		const initialRedraws = tui.fullRedraws;
+		terminal.clearWrites();
+
+		// Rows 7-11 are visible; changing row 5 (off-screen) through row 8 (on-screen) must
+		// clamp to the visible range instead of falling back to a full redraw.
+		component.lines[5] = "Line 5 UPDATED";
+		component.lines[8] = "Line 8 UPDATED";
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.strictEqual(tui.fullRedraws, initialRedraws, "Change spanning the viewport edge should stay differential");
+		assert.ok(!terminal.getWrites().includes("\x1b[3J"), "Should not clear scrollback");
+		assert.deepStrictEqual(terminal.getViewport(), ["Line 7", "Line 8 UPDATED", "Line 9", "Line 10", "Line 11"]);
+
+		tui.stop();
+	});
+
+	it("still full-redraws when an off-screen change is combined with a shrink", async () => {
+		const terminal = new VirtualTerminal(20, 5);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = Array.from({ length: 12 }, (_, i) => `Line ${i}`);
+		tui.start();
+		await terminal.waitForRender();
+
+		const initialRedraws = tui.fullRedraws;
+
+		// Shrinks to 10 lines *and* changes an off-screen line (3) plus an on-screen one (8):
+		// the viewport itself must slide up, which the differential path can't express.
+		const shrunk = Array.from({ length: 10 }, (_, i) => `Line ${i}`);
+		shrunk[3] = "Line 3 UPDATED";
+		shrunk[8] = "Line 8 UPDATED";
+		component.lines = shrunk;
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		assert.ok(tui.fullRedraws > initialRedraws, "Off-screen change combined with a shrink should still full-redraw");
+		assert.deepStrictEqual(terminal.getViewport(), ["Line 5", "Line 6", "Line 7", "Line 8 UPDATED", "Line 9"]);
+
+		tui.stop();
+	});
+});
+
+// Regression coverage for Windows ConPTY autowrap drift (the editor appearing to "scroll to
+// top" / cursor lost below the fold) - see the comment above DISABLE_AUTOWRAP in
+// tui-main-screen.ts. Fullscreen mode already disabled autowrap; this mirrors that guard for
+// the main screen.
+describe("TUI main screen autowrap", () => {
+	it("disables terminal autowrap on start and restores it on stop", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+		component.lines = ["Line 0"];
+
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[?7l"), "Autowrap should be disabled on start");
+
+		terminal.clearWrites();
+		tui.stop();
+		assert.ok(terminal.getWrites().includes("\x1b[?7h"), "Autowrap should be re-enabled on stop");
+	});
+
+	it("re-disables autowrap on a subsequent start (e.g. resuming after a passthrough command)", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+		component.lines = ["Line 0"];
+
+		tui.start();
+		await terminal.waitForRender();
+		tui.stop();
+
+		terminal.clearWrites();
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[?7l"), "Autowrap should be disabled again after restarting");
+
+		tui.stop();
+	});
+});
