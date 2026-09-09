@@ -7,6 +7,18 @@ import { visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
+// Every rendered line is already pre-wrapped to `width` (see the crash check in doRender()),
+// so the terminal's own autowrap is never actually relied on - and on Windows ConPTY it's
+// actively harmful: ConPTY commits the wrap eagerly when the last column is written, moving
+// the physical cursor down a row without pi's hardwareCursorRow tracking accounting for it.
+// Relative \r\n navigation between full-width lines then advances two rows instead of one, so
+// every repaint drifts one row lower - the editor appears to drift/scroll and the cursor is
+// pushed below the screen edge. xterm-style terminals leave the wrap pending until the next
+// character (so \r cancels it), which is why this only reproduces on Windows.
+// The alt-screen (fullscreen) renderer already disables autowrap for this exact reason; this
+// mirrors that for the main screen.
+const DISABLE_AUTOWRAP = "\x1b[?7l";
+const ENABLE_AUTOWRAP = "\x1b[?7h";
 
 /**
  * Streams terminal output in 1 MiB chunks so a full render never forms one string large enough to exceed V8's limit.
@@ -165,7 +177,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.previousViewportTop = 0;
 	}
 
+	protected override afterTerminalStart(): void {
+		this.terminal.write(DISABLE_AUTOWRAP);
+	}
+
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
+		this.terminal.write(ENABLE_AUTOWRAP);
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
 		const targetRow = this.previousLines.length;
@@ -386,7 +403,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
 		}
-		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
@@ -446,13 +462,53 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return;
 		}
 
-		// Differential rendering can only touch what was actually visible.
-		// If the first changed line is above the previous viewport, we need a full redraw.
+		// Differential rendering can only touch what's actually on screen. Lines above the
+		// viewport are already in the terminal's scrollback: a change up there isn't visible,
+		// so (unlike the old unconditional full redraw here) it usually doesn't need one either
+		// - that full redraw was the cause of pi's terminal "randomly" jumping to the top and
+		// wiping scrollback while streaming (fullRender clears scrollback via ESC[3J).
 		if (firstChanged < prevViewportTop) {
-			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			fullRender(true);
-			return;
+			if (lastChanged < prevViewportTop) {
+				// Every changed row is off-screen - nothing visible differs. Update bookkeeping
+				// so future diffs stay correct, but don't touch the terminal at all.
+				logRedraw(`skip: all changes above viewport (${firstChanged}..${lastChanged} < ${prevViewportTop})`);
+				this.previousLines = newLines;
+				this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+				this.previousWidth = width;
+				this.previousHeight = height;
+				this.previousViewportTop = prevViewportTop;
+				this.cursorRow = Math.max(0, newLines.length - 1);
+				this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+				this.positionHardwareCursor(cursorPos, newLines.length);
+				return;
+			}
+			if (newLines.length < this.previousLines.length) {
+				// Content shrank while the change starts off-screen: the viewport itself must
+				// slide up to stay pinned to the bottom, which a relative repaint can't express.
+				// Fall back to a full redraw (rare: a large block collapsing).
+				logRedraw(
+					`firstChanged < viewportTop and content shrank (${firstChanged} < ${prevViewportTop}, ${newLines.length} < ${this.previousLines.length})`,
+				);
+				fullRender(true);
+				return;
+			}
+			// Off-screen history changed but the viewport's own rows are unaffected (stable or
+			// growing content): clamp to the visible range and repaint only that in place.
+			firstChanged = prevViewportTop;
+			const reExpanded = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
+			firstChanged = reExpanded.firstChanged;
+			lastChanged = reExpanded.lastChanged;
+			if (firstChanged < prevViewportTop) {
+				// A kitty image straddles the viewport boundary, so its first row is off-screen
+				// too and can't be repainted in place. Fall back to a full redraw.
+				logRedraw(`clamped range still crosses viewport via kitty image (${firstChanged} < ${prevViewportTop})`);
+				fullRender(true);
+				return;
+			}
+			logRedraw(`clamp: firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 		}
+
+		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
 		// Render from first changed line to end
 		// Keep updates wrapped in synchronized output while writing bounded chunks.
